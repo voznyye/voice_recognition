@@ -1,0 +1,10 @@
+datasets
+*dev-clean*
+train-clean
+test-clean
+test-other
+*LibriSpeech*
+.venv
+.vscode
+*pycache*
+trained*
