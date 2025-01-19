@@ -8,3 +8,8 @@ test-other
 .vscode
 *pycache*
 trained*
+cv-corpus*
+clip*
+clip_*
+test-*
+train-*

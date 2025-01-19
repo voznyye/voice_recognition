@@ -6,15 +6,20 @@ from torch.utils.data import DataLoader, Dataset
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import multiprocessing
+import time
 
-# Функция извлечения признаков
-def extract_features(audio_path, n_mels=80):  # Устанавливаем 80 мел-частотных коэффициентов
+# Set the start method for multiprocessing
+multiprocessing.set_start_method('spawn', force=True)
+
+# Function to extract features on GPU
+def extract_features(audio_path, n_mels=80, device='cpu'):
     waveform, sample_rate = torchaudio.load(audio_path)
-    mel_spec = torchaudio.transforms.MelSpectrogram(n_mels=n_mels)(waveform)  # 80 мел-частотных коэффициентов
+    mel_spec = torchaudio.transforms.MelSpectrogram(n_mels=n_mels)(waveform).to(device)  # Moving to GPU
     mel_spec = mel_spec.squeeze(0).transpose(0, 1)  # (time, freq) shape
     return mel_spec
 
-# Модель LSTM
+# LSTM Model
 class LSTMModel(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
         super(LSTMModel, self).__init__()
@@ -22,16 +27,18 @@ class LSTMModel(nn.Module):
         self.fc = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
-        lstm_out, _ = self.lstm(x)  # LSTM возвращает выход и скрытые состояния
-        lstm_out = lstm_out[:, -1, :]  # Используем выход последнего временного шага
+        lstm_out, _ = self.lstm(x)
+        lstm_out = lstm_out[:, -1, :]  # Last timestep
         out = self.fc(lstm_out)
         return out
 
-# Пользовательский Dataset для LibriSpeech
+# Custom Dataset
 class CustomDataset(Dataset):
-    def __init__(self, data_path):
+    def __init__(self, data_path, label_map, device):
         with open(data_path, 'r') as f:
             self.data = json.load(f)
+        self.label_map = label_map
+        self.device = device
 
     def __len__(self):
         return len(self.data)
@@ -39,88 +46,100 @@ class CustomDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.data[idx]
         audio_path = sample['audio_path']
-        features = extract_features(audio_path)  # Извлекаем признаки из аудио
-        label = sample['label']
+
+        features = extract_features(audio_path, device=self.device)  # Moving feature extraction to GPU
+        label = self.label_map[sample['label']]
         return features, label
 
-# Функция преобразования транскрипта в тензор
-def transcript_to_tensor(transcript, label_map):
-    first_char = transcript[0]
-    
-    # Проверяем, есть ли символ в маппинге
-    if first_char not in label_map:
-        label_map[first_char] = len(label_map)  # Присваиваем новый индекс для символа
-    
-    # Возвращаем индекс символа
-    return label_map[first_char]
+# Creating the label map
+def create_label_map(data_path):
+    with open(data_path, 'r') as f:
+        data = json.load(f)
+    label_map = {}
+    for sample in data:
+        label = sample['label']
+        if label not in label_map:
+            label_map[label] = len(label_map)
+    return label_map
 
-# Функция для обработки батчей
+# Batch processing
 def collate_fn(batch, input_dim, device):
     inputs = []
     labels = []
     max_length = max([sample[0].size(0) for sample in batch])
 
-    for sample in batch:
-        features, label = sample
-        padded_features = F.pad(features, (0, 0, 0, max_length - features.size(0)))  # Дополняем до максимальной длины
+    for features, label in batch:
+        padded_features = F.pad(features, (0, 0, 0, max_length - features.size(0)))
         inputs.append(padded_features)
+        labels.append(label)
 
-        label_tensor = transcript_to_tensor(label, label_map)
-        labels.append(label_tensor)  # Добавляем числовой индекс, а не строку
-
-    inputs = torch.stack(inputs).to(device)  # Перемещаем данные на GPU
-    labels = torch.tensor(labels, dtype=torch.long).to(device)  # Перемещаем метки на GPU
-
+    inputs = torch.stack(inputs).to(device)
+    labels = torch.tensor(labels, dtype=torch.long).to(device)
     return inputs, labels
 
-# Функция для подсчета количества классов
-def get_output_dim(labels):
-    return len(set(labels))  # количество уникальных классов
+# Model training
+def train_lstm_model(dataset_path, save_path, input_dim=80, hidden_dim=128, num_epochs=100, batch_size=128, num_workers=0):
+    device = torch.device('cuda')
 
-# Функция обучения модели
-def train_lstm_model(dataset_path, save_path, input_dim=80, hidden_dim=64, num_epochs=100, batch_size=16):
-    # Определяем устройство
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Creating label map
+    label_map = create_label_map(dataset_path)
+    output_dim = len(label_map)
 
-    # Загружаем датасет
-    dataset = CustomDataset(dataset_path)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda batch: collate_fn(batch, input_dim, device))
+    # Loading the dataset
+    dataset = CustomDataset(dataset_path, label_map, device)
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,  # Setting num_workers to 0 for Windows
+        collate_fn=lambda batch: collate_fn(batch, input_dim, device),  # Replaced with a regular function
+    )
 
-    # Получаем метки из датасета
-    all_labels = []
-    for _, labels in dataset:
-        all_labels.extend(labels)
-
-    output_dim = get_output_dim(all_labels)
-
-    # Создаем модель с правильным количеством выходных классов
-    model = LSTMModel(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim).to(device)  # Перемещаем модель на GPU
+    model = LSTMModel(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    # Тренировка модели
+    print(f"Starting training on device: {device}")
+
     for epoch in range(num_epochs):
-        print(f"Epoch {epoch + 1}/{num_epochs}")
+        start_time = time.time()  # Remembering the start time of the epoch
+
+        model.train()
+        total_loss = 0
         for i, (inputs, labels) in enumerate(dataloader):
-            inputs, labels = inputs.to(device), labels.to(device)  # Перемещаем данные на GPU
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
             optimizer.zero_grad()
+            outputs = model(inputs)
+
+            # Checking the label range
+            if (labels < 0).any() or (labels >= output_dim).any():
+                raise ValueError(f"Labels out of range: {labels}")
+
+            loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+            total_loss += loss.item()
 
-        print(f"Epoch [{epoch + 1}/{num_epochs}] Loss: {loss.item():.4f}")
-    
-    # Сохраняем модель
+            # Logging
+            if i % 10 == 0:
+                print(f"Epoch [{epoch + 1}/{num_epochs}], Step [{i}/{len(dataloader)}], Loss: {loss.item():.4f}")
+
+        end_time = time.time()  # Remembering the end time of the epoch
+        epoch_duration = end_time - start_time  # Time taken for the epoch
+
+        print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {total_loss / len(dataloader):.4f}, Time: {epoch_duration:.2f}s")
+
+    # Saving the model and label map
     os.makedirs(save_path, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(save_path, "lstm_model.pth"))
-    print("Model saved!")
+    with open(os.path.join(save_path, "label_map.json"), "w") as f:
+        json.dump(label_map, f)
+    print("Model and label map saved!")
 
-
-# Инициализация пустой карты меток
-label_map = {}
-
-# Подготовка датасета и обучение модели
+# Paths
 dataset_path = "./datasets/train_clean_100.json"
-save_directory = "./trained_lstm_model"  # Указываем путь для сохранения модели
-train_lstm_model(dataset_path, save_path=save_directory)
+save_directory = "./trained_lstm_model1"
+
+# Training
+if __name__ == "__main__":
+    train_lstm_model(dataset_path, save_path=save_directory)

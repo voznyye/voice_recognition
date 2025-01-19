@@ -1,20 +1,20 @@
-import os
-import json
 import torch
 import torchaudio
-import torch.nn as nn
+import sacrebleu
+from jiwer import wer, cer
+import json
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
+import torch.nn as nn
 
-# Функция извлечения признаков
-def extract_features(audio_path, n_mels=80):
+# Function to extract features on GPU
+def extract_features(audio_path, n_mels=80, device='cpu'):
     waveform, sample_rate = torchaudio.load(audio_path)
-    mel_spec = torchaudio.transforms.MelSpectrogram(n_mels=n_mels)(waveform)
-    mel_spec = mel_spec.squeeze(0).transpose(0, 1)
+    mel_spec = torchaudio.transforms.MelSpectrogram(n_mels=n_mels)(waveform).to(device)  # Moving to GPU
+    mel_spec = mel_spec.squeeze(0).transpose(0, 1)  # (time, freq) shape
     return mel_spec
 
-# Модель LSTM
+# LSTM Model
 class LSTMModel(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
         super(LSTMModel, self).__init__()
@@ -23,15 +23,17 @@ class LSTMModel(nn.Module):
 
     def forward(self, x):
         lstm_out, _ = self.lstm(x)
-        lstm_out = lstm_out[:, -1, :]
+        lstm_out = lstm_out[:, -1, :]  # Last timestep
         out = self.fc(lstm_out)
         return out
 
-# Пользовательский Dataset для LibriSpeech
+# Custom Dataset
 class CustomDataset(Dataset):
-    def __init__(self, data_path):
+    def __init__(self, data_path, label_map, device):
         with open(data_path, 'r') as f:
             self.data = json.load(f)
+        self.label_map = label_map
+        self.device = device
 
     def __len__(self):
         return len(self.data)
@@ -39,76 +41,83 @@ class CustomDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.data[idx]
         audio_path = sample['audio_path']
-        features = extract_features(audio_path)
-        label = sample['label']
+
+        features = extract_features(audio_path, device=self.device)  # Moving feature extraction to GPU
+        label = self.label_map[sample['label']]
         return features, label
 
-# Функция преобразования транскрипта в тензор
-def transcript_to_tensor(transcript, label_map):
-    first_char = transcript[0]
-    if first_char not in label_map:
-        label_map[first_char] = len(label_map)
-    return label_map[first_char]
-
-# Функция для обработки батчей
-def collate_fn(batch, input_dim):
+# Creating label map
+def create_label_map(data_path):
+    with open(data_path, 'r') as f:
+        data = json.load(f)
     label_map = {}
+    for sample in data:
+        label = sample['label']
+        if label not in label_map:
+            label_map[label] = len(label_map)
+    return label_map
+
+# Batch processing
+def collate_fn(batch, input_dim, device):
     inputs = []
     labels = []
     max_length = max([sample[0].size(0) for sample in batch])
 
-    for sample in batch:
-        features, label = sample
+    for features, label in batch:
         padded_features = F.pad(features, (0, 0, 0, max_length - features.size(0)))
         inputs.append(padded_features)
-        label_tensor = torch.tensor(transcript_to_tensor(label, label_map), dtype=torch.long)
-        labels.append(label_tensor)
+        labels.append(label)
 
-    inputs = torch.stack(inputs)
-    labels = torch.tensor(labels, dtype=torch.long)
+    inputs = torch.stack(inputs).to(device)
+    labels = torch.tensor(labels, dtype=torch.long).to(device)
     return inputs, labels
 
-# Функция подсчета метрик
-def calculate_metrics(true_labels, predicted_labels):
-    precision = precision_score(true_labels, predicted_labels, average='weighted', zero_division=0)
-    recall = recall_score(true_labels, predicted_labels, average='weighted', zero_division=0)
-    f1 = f1_score(true_labels, predicted_labels, average='weighted', zero_division=0)
-    cm = confusion_matrix(true_labels, predicted_labels)
-    return precision, recall, f1, cm
+# Function to convert indices to text
+def indices_to_text(indices, label_map):
+    return [list(label_map.keys())[list(label_map.values()).index(idx)] for idx in indices]
 
-# Функция для тестирования модели
-def test_lstm_model(test_dataset_path, model_path, input_dim=80, batch_size=16):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    test_dataset = CustomDataset(test_dataset_path)
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda batch: collate_fn(batch, input_dim))
-
-    model = LSTMModel(input_dim=input_dim, hidden_dim=64, output_dim=28).to(device)  # Измените output_dim на 28
-    model.load_state_dict(torch.load(model_path, map_location=device))
+# Model evaluation using BLEU, WER, and CER
+def evaluate_model(model, dataloader, label_map, device='cuda'):
     model.eval()
-
-    all_true_labels = []
-    all_predicted_labels = []
-
+    predictions = []
+    references = []
+    
     with torch.no_grad():
-        for inputs, labels in test_dataloader:
-            inputs, labels = inputs.to(device), labels.to(device)
+        for inputs, labels in dataloader:
+            inputs = inputs.to(device)
             outputs = model(inputs)
-            _, predicted = torch.max(outputs, 1)
-            all_true_labels.extend(labels.cpu().numpy())
-            all_predicted_labels.extend(predicted.cpu().numpy())
+            _, predicted_labels = torch.max(outputs, dim=1)
+            
+            # Converting indices to text
+            pred_text = indices_to_text(predicted_labels.tolist(), label_map)
+            true_text = indices_to_text(labels.tolist(), label_map)
+            
+            predictions.extend(pred_text)
+            references.extend(true_text)
+    
+    # BLEU
+    bleu_score = sacrebleu.corpus_bleu(predictions, [references])
+    print(f"BLEU score: {bleu_score.score:.2f}")
 
-    precision, recall, f1, cm = calculate_metrics(all_true_labels, all_predicted_labels)
+    # WER and CER
+    wer_score = wer(references, predictions)
+    cer_score = cer(references, predictions)
+    
+    print(f"WER: {wer_score * 100:.2f}%")
+    print(f"CER: {cer_score * 100:.2f}%")
 
-    # Вывод метрик
-    print("\n=== Results ===")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"F1 Score: {f1:.4f}")
-    print("Confusion Matrix:")
-    print(cm)
+# Example usage
+if __name__ == "__main__":
+    dataset_path = "./datasets/train_clean_100.json"
+    label_map = create_label_map(dataset_path)
+    output_dim = len(label_map)
 
-# Подготовка тестирования
-test_dataset_path = "./datasets/test_clean.json"
-model_path = "./trained_lstm_model/lstm_model.pth"
-test_lstm_model(test_dataset_path, model_path)
+    dataset = CustomDataset(dataset_path, label_map, device='cuda')
+    dataloader = DataLoader(dataset, batch_size=128, shuffle=True, num_workers=0, collate_fn=lambda batch: collate_fn(batch, input_dim=80, device='cuda'))
+
+    # Loading the model
+    model = LSTMModel(input_dim=80, hidden_dim=128, output_dim=output_dim).to('cuda')
+    model.load_state_dict(torch.load("./trained_lstm_model/lstm_model.pth"))
+
+    # Model evaluation
+    evaluate_model(model, dataloader, label_map, device='cuda')
